@@ -7,12 +7,17 @@
  *    M1(BL,GPIO4) | M3(BR,GPIO2)
  *
  *  ESC: DL03  50Hz PWM  0.9ms(stop) → 2.0ms(max)
- *  10-bit resolution → stop=46, max=102
+ *  10-bit resolution → stop=46, idle=54(bench-verify), max=102
  *
  *  I2C: SDA=38, SCL=39
  *  MPU6050: 0x68
  *
  *  Modes: ANGLE (self-level) / ACRO (rate)
+ *
+ *  Architecture: stabilization runs in a fixed 500Hz FreeRTOS task
+ *  (controlTask), fully decoupled from WiFi. The web handlers only
+ *  write setpoints; a link-loss failsafe levels & idles the craft if
+ *  no /drive packet arrives within FAILSAFE_MS.
  * ============================================================
  */
 
@@ -35,9 +40,24 @@ const char* AP_PASS = "12345678";
 #define PWM_FREQ       50
 #define PWM_RESOLUTION 10          // 10-bit → 1024 steps, 1 step ≈ 0.01953ms
 #define ESC_STOP       46          // 0.9ms  → 46.08 ≈ 46
-#define ESC_MIN        50          // just above stop, starts spinning
+#define ESC_IDLE       54          // armed idle: ALL 4 props must spin here.
+                                   //   Bench-verify props-off; sandbox found ~65 needed.
 #define ESC_MAX        102         // 2.0ms  → 102.4 ≈ 102
-#define ESC_ARM_DELAY  2200        // ms after stop signal before sending throttle
+#define ESC_ARM_DELAY  2200        // ms holding stop signal at boot for ESC init
+
+// ─── Control loop ───────────────────────────────────────────
+#define LOOP_HZ      500                          // fixed-rate stabilization loop
+#define LOOP_PERIOD  pdMS_TO_TICKS(1000 / LOOP_HZ)
+#define FAILSAFE_MS  400                          // no /drive packet → level & idle
+#define I_LIMIT      40.0f                         // integral clamp
+#define PID_LIMIT    30.0f                         // per-axis correction clamp (ESC units)
+
+// ─── Mixer sign trims ───────────────────────────────────────
+// Flip any of these to -1 if the props-off tilt test shows an axis
+// correcting the WRONG way (watch the motor values in /telem or serial).
+#define ROLL_SIGN   (+1)
+#define PITCH_SIGN  (+1)
+#define YAW_SIGN    (+1)
 
 // ─── I2C / MPU6050 ──────────────────────────────────────────
 #define SDA_PIN   38
@@ -57,8 +77,16 @@ FlightMode flightMode = ANGLE_MODE;
 
 bool armed = false;
 
-// Joystick inputs  (-1.0 … +1.0)
-volatile float jLX = 0, jLY = 0, jRX = 0, jRY = 0;
+// ─── Setpoints (written by /drive, read by control task) ────
+//   normalized -1..+1.  spThrottle useful range 0..+1.
+volatile float spThrottle = 0, spRoll = 0, spPitch = 0, spYaw = 0;
+volatile uint32_t lastDriveMs = 0;
+
+// Gyro bias (deg/s), measured & removed at boot by calibrateGyro()
+float gxBias = 0, gyBias = 0, gzBias = 0;
+
+// Last motor outputs (ESC units), for telemetry / props-off bench test
+float lastM[4] = {0, 0, 0, 0};
 
 // ─── IMU data ───────────────────────────────────────────────
 struct IMUData {
@@ -79,7 +107,7 @@ PIDState stRoll = {}, stPitch = {}, stYaw = {};
 // ─── Low-pass filter for accel ──────────────────────────────
 struct LPF { float val; float alpha; };
 LPF lpAx = {0, 0.1f}, lpAy = {0, 0.1f}, lpAz = {0, 0.1f};
-LPF lpGx = {0, 0.3f}, lpGy = {0, 0.3f}, lpGz = {0, 0.3f};
+LPF lpGx = {0, 0.5f}, lpGy = {0, 0.5f}, lpGz = {0, 0.5f};  // lighter → less phase lag
 
 inline float lpfUpdate(LPF &f, float raw) {
   f.val = f.alpha * raw + (1.0f - f.alpha) * f.val;
@@ -110,99 +138,103 @@ void stopAllMotors() {
   for (int i = 0; i < 4; i++) ledcWrite(motorPins[i], ESC_STOP);
 }
 
-// Arm sequence: send stop, wait, ready
+void resetPID() {
+  stRoll.integral = stPitch.integral = stYaw.integral = 0;
+  stRoll.prevError = stPitch.prevError = stYaw.prevError = 0;
+}
+
+// ESCs are already initialized (stop signal held) at boot, so runtime
+// arm/disarm just gates whether the control task drives throttle.
 void armESC() {
-  Serial.println("[ESC] Arming — sending stop signal...");
-  stopAllMotors();
-  delay(ESC_ARM_DELAY);
-  Serial.println("[ESC] Armed and ready.");
+  resetPID();
+  lastDriveMs = millis();   // start with a fresh failsafe window
   armed = true;
+  Serial.println("[ESC] Armed — motors at idle.");
 }
 
 void disarmESC() {
-  stopAllMotors();
   armed = false;
+  stopAllMotors();
   Serial.println("[ESC] Disarmed.");
 }
 
 // ============================================================
-//  droneDrive(LY, LX, RY, RX)
-//  LY = throttle (-1…+1, up is +1)
-//  LX = yaw      (-1…+1)
-//  RY = pitch    (-1…+1, forward is +1)
-//  RX = roll     (-1…+1, right is +1)
+//  controlUpdate(dt)  — runs at LOOP_HZ inside controlTask.
+//  Reads latest setpoints, computes PID, mixes to motors.
+//  Setpoint convention (from /drive):
+//    spThrottle 0..+1 (up)   spYaw -1..+1   spPitch -1..+1 (fwd)   spRoll -1..+1 (right)
 // ============================================================
-void droneDrive(float LY, float LX, float RY, float RX) {
-  if (!armed) { stopAllMotors(); return; }
+void controlUpdate(float dt) {
+  if (!armed) { stopAllMotors(); resetPID(); return; }
 
-  // Throttle: map 0…+1 → ESC_MIN…ESC_MAX  (negative = 0 throttle)
-  float throttle = constrain(LY, -1.0f, 1.0f);
-  float tBase;
-  if (throttle <= 0.0f) {
-    stopAllMotors();
-    return;
-  } else {
-    tBase = ESC_MIN + throttle * (ESC_MAX - ESC_MIN);
+  // Snapshot volatile setpoints once.
+  float thr = spThrottle, sRoll = spRoll, sPitch = spPitch, sYaw = spYaw;
+
+  // ── Link-loss failsafe: level & settle to idle ──────────
+  if (millis() - lastDriveMs > FAILSAFE_MS) {
+    thr = 0; sRoll = 0; sPitch = 0; sYaw = 0;
   }
+
+  float throttle01 = constrain(thr, 0.0f, 1.0f);
+  float tBase = ESC_IDLE + throttle01 * (ESC_MAX - ESC_IDLE);
 
   // ── PID correction ──────────────────────────────────────
-  float pidCorrRoll  = 0;
-  float pidCorrPitch = 0;
-  float pidCorrYaw   = 0;
-
+  float cRoll, cPitch, cYaw;
   if (flightMode == ANGLE_MODE) {
-    // Setpoints in degrees
-    float spRoll  = RX  * 25.0f;   // max ±25°
-    float spPitch = RY  * 25.0f;
-    pidCorrRoll  = computePID(stRoll,  pidRoll,  spRoll  - imu.roll);
-    pidCorrPitch = computePID(stPitch, pidPitch, spPitch - imu.pitch);
-    pidCorrYaw   = computePID(stYaw,   pidYaw,   LX * 90.0f - imu.gz);
+    // Setpoints in degrees; D damps on the measured angular rate (gyro).
+    float spRollDeg  = sRoll  * 25.0f;   // max ±25°
+    float spPitchDeg = sPitch * 25.0f;
+    cRoll  = computePID(stRoll,  pidRoll,  spRollDeg  - imu.roll,  imu.gx, dt);
+    cPitch = computePID(stPitch, pidPitch, spPitchDeg - imu.pitch, imu.gy, dt);
+    cYaw   = computePID(stYaw,   pidYaw,   sYaw * 90.0f - imu.gz,   0.0f,   dt);
   } else {
-    // ACRO: setpoints are target rates (deg/s)
-    float spRollRate  = RX  * 200.0f;
-    float spPitchRate = RY  * 200.0f;
-    float spYawRate   = LX  * 150.0f;
-    pidCorrRoll  = computePID(stRoll,  pidRoll,  spRollRate  - imu.gx);
-    pidCorrPitch = computePID(stPitch, pidPitch, spPitchRate - imu.gy);
-    pidCorrYaw   = computePID(stYaw,   pidYaw,   spYawRate   - imu.gz);
+    // ACRO: setpoints are target rates (deg/s).
+    float spRollRate  = sRoll  * 200.0f;
+    float spPitchRate = sPitch * 200.0f;
+    float spYawRate   = sYaw   * 150.0f;
+    cRoll  = computePID(stRoll,  pidRoll,  spRollRate  - imu.gx, 0.0f, dt);
+    cPitch = computePID(stPitch, pidPitch, spPitchRate - imu.gy, 0.0f, dt);
+    cYaw   = computePID(stYaw,   pidYaw,   spYawRate   - imu.gz, 0.0f, dt);
   }
+
+  // Per-axis sign trims (set via #define after bench test).
+  cRoll *= ROLL_SIGN;  cPitch *= PITCH_SIGN;  cYaw *= YAW_SIGN;
+
+  // Avoid integral wind-up while sitting at idle (props not lifting).
+  if (throttle01 < 0.05f) resetPID();
 
   // ── X-frame mixing ──────────────────────────────────────
   // Motor spin direction:
   //   M1 BL CCW, M2 FL CW, M3 BR CW, M4 FR CCW
   //
-  //  Throttle  +1 +1 +1 +1
   //  Roll(R+)  -1 -1 +1 +1   (right motors up)
-  //  Pitch(F+) +1 -1 +1 -1   (front motors up when pitch back)
+  //  Pitch(F+) +1 -1 +1 -1   (rear motors up when pitching forward)
   //  Yaw       +1 -1 -1 +1   (CCW motors increase for CW yaw)
-
-  float m1 = tBase + pidCorrPitch - pidCorrRoll + pidCorrYaw; // BL CCW
-  float m2 = tBase - pidCorrPitch - pidCorrRoll - pidCorrYaw; // FL CW
-  float m3 = tBase + pidCorrPitch + pidCorrRoll - pidCorrYaw; // BR CW
-  float m4 = tBase - pidCorrPitch + pidCorrRoll + pidCorrYaw; // FR CCW
+  float m1 = tBase + cPitch - cRoll + cYaw; // BL CCW
+  float m2 = tBase - cPitch - cRoll - cYaw; // FL CW
+  float m3 = tBase + cPitch + cRoll - cYaw; // BR CW
+  float m4 = tBase - cPitch + cRoll + cYaw; // FR CCW
 
   setMotorRaw(0, (int)m1);
   setMotorRaw(1, (int)m2);
   setMotorRaw(2, (int)m3);
   setMotorRaw(3, (int)m4);
+
+  lastM[0] = m1; lastM[1] = m2; lastM[2] = m3; lastM[3] = m4;
 }
 
 // ============================================================
-//  PID compute  (returns correction in ESC units)
+//  PID compute  (returns correction in ESC units, clamped)
+//  measRate = rate of the *measured* variable (deg/s).  We damp on
+//  it (derivative-on-measurement) instead of d(error)/dt to avoid
+//  the "derivative kick" when the stick / setpoint jumps.
 // ============================================================
-float computePID(PIDState &st, PIDGains &g, float error) {
-  unsigned long now = micros();
-  float dt = (st.lastTime == 0) ? 0.01f : (now - st.lastTime) / 1e6f;
-  dt = constrain(dt, 0.001f, 0.1f);
-  st.lastTime = now;
-
+float computePID(PIDState &st, PIDGains &g, float error, float measRate, float dt) {
   st.integral += error * dt;
-  st.integral  = constrain(st.integral, -50.0f, 50.0f); // anti-windup
+  st.integral  = constrain(st.integral, -I_LIMIT, I_LIMIT); // anti-windup
 
-  float derivative = (error - st.prevError) / dt;
-  st.prevError = error;
-
-  return g.kp * error + g.ki * st.integral + g.kd * derivative;
+  float out = g.kp * error + g.ki * st.integral - g.kd * measRate;
+  return constrain(out, -PID_LIMIT, PID_LIMIT);
 }
 
 // ============================================================
@@ -222,7 +254,9 @@ void mpuInit() {
   Wire.endTransmission(true);
 }
 
-void mpuRead() {
+// Raw burst read → engineering units (g and deg/s). No bias/filter.
+void mpuReadRaw(float &ax, float &ay, float &az,
+                float &gx, float &gy, float &gz) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission(false);
@@ -236,14 +270,35 @@ void mpuRead() {
   int16_t rGy = Wire.read()<<8|Wire.read();
   int16_t rGz = Wire.read()<<8|Wire.read();
 
-  // Convert + software LPF (vibration rejection)
-  float rawAx = (float)rAx / 16384.0f;
-  float rawAy = (float)rAy / 16384.0f;
-  float rawAz = (float)rAz / 16384.0f;
-  float rawGx = (float)rGx / 65.5f;   // ±500 deg/s sensitivity
-  float rawGy = (float)rGy / 65.5f;
-  float rawGz = (float)rGz / 65.5f;
+  ax = (float)rAx / 16384.0f;
+  ay = (float)rAy / 16384.0f;
+  az = (float)rAz / 16384.0f;
+  gx = (float)rGx / 65.5f;   // ±500 deg/s sensitivity
+  gy = (float)rGy / 65.5f;
+  gz = (float)rGz / 65.5f;
+}
 
+// Average gyro at rest to find bias. Craft MUST be still.
+void calibrateGyro() {
+  Serial.println("[IMU] Calibrating gyro — keep still ~2s...");
+  const int N = 1000;
+  float sx = 0, sy = 0, sz = 0, ax, ay, az, gx, gy, gz;
+  for (int i = 0; i < N; i++) {
+    mpuReadRaw(ax, ay, az, gx, gy, gz);
+    sx += gx; sy += gy; sz += gz;
+    delay(2);
+  }
+  gxBias = sx / N; gyBias = sy / N; gzBias = sz / N;
+  Serial.printf("[IMU] Gyro bias: gx=%.2f gy=%.2f gz=%.2f deg/s\n",
+                gxBias, gyBias, gzBias);
+}
+
+void mpuRead() {
+  float rawAx, rawAy, rawAz, rawGx, rawGy, rawGz;
+  mpuReadRaw(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz);
+  rawGx -= gxBias; rawGy -= gyBias; rawGz -= gzBias;
+
+  // Software LPF (vibration rejection on top of the MPU's 44Hz DLPF)
   imu.ax = lpfUpdate(lpAx, rawAx);
   imu.ay = lpfUpdate(lpAy, rawAy);
   imu.az = lpfUpdate(lpAz, rawAz);
@@ -253,14 +308,35 @@ void mpuRead() {
 
   // Complementary filter  (alpha = 0.98 → trust gyro, small accel correction)
   static unsigned long lastUs = 0;
-  float dt = lastUs ? (micros() - lastUs) / 1e6f : 0.01f;
+  float dt = lastUs ? (micros() - lastUs) / 1e6f : (1.0f / LOOP_HZ);
   lastUs = micros();
+  dt = constrain(dt, 0.0005f, 0.02f);
 
   float accRoll  = atan2f(imu.ay, imu.az) * 57.2958f;
   float accPitch = atan2f(-imu.ax, sqrtf(imu.ay*imu.ay + imu.az*imu.az)) * 57.2958f;
 
   imu.roll  = 0.98f * (imu.roll  + imu.gx * dt) + 0.02f * accRoll;
   imu.pitch = 0.98f * (imu.pitch + imu.gy * dt) + 0.02f * accPitch;
+}
+
+// ============================================================
+//  Control task — fixed LOOP_HZ, pinned to a core, independent
+//  of WiFi.  IMU → attitude → PID → motors every tick.
+// ============================================================
+void controlTask(void *pv) {
+  TickType_t lastWake = xTaskGetTickCount();
+  uint32_t lastUs = micros();
+  for (;;) {
+    uint32_t now = micros();
+    float dt = (now - lastUs) / 1e6f;
+    lastUs = now;
+    dt = constrain(dt, 0.0005f, 0.02f);
+
+    mpuRead();
+    controlUpdate(dt);
+
+    vTaskDelayUntil(&lastWake, LOOP_PERIOD);
+  }
 }
 
 // ============================================================
@@ -530,21 +606,26 @@ void setupServer() {
     }
   });
 
+  // Only stores setpoints + a timestamp; the control task does the flying.
   server.on("/drive", HTTP_GET, [](){
-    float LY = server.arg("LY").toFloat();
-    float LX = server.arg("LX").toFloat();
-    float RY = server.arg("RY").toFloat();
-    float RX = server.arg("RX").toFloat();
-    droneDrive(LY, LX, RY, RX);
+    spThrottle  = server.arg("LY").toFloat();   // throttle
+    spYaw       = server.arg("LX").toFloat();   // yaw
+    spPitch     = server.arg("RY").toFloat();   // pitch
+    spRoll      = server.arg("RX").toFloat();   // roll
+    lastDriveMs = millis();                     // pet the failsafe
     server.send(200,"text/plain","ok");
   });
 
   server.on("/telem", HTTP_GET, [](){
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<192> doc;
     doc["roll"]  = imu.roll;
     doc["pitch"] = imu.pitch;
     doc["gz"]    = imu.gz;
     doc["armed"] = armed;
+    doc["m1"]    = (int)lastM[0];
+    doc["m2"]    = (int)lastM[1];
+    doc["m3"]    = (int)lastM[2];
+    doc["m4"]    = (int)lastM[3];
     String out;
     serializeJson(doc, out);
     server.send(200,"application/json", out);
@@ -584,11 +665,14 @@ void setup() {
   mpuInit();
   Serial.println("[IMU] MPU6050 init OK");
 
-  // ESC init — send stop before WiFi (takes 2s, good timing)
+  // Gyro bias — craft must be still on the ground here.
+  calibrateGyro();
+
+  // ESC init — hold stop signal so ESCs arm during boot.
   escInit();
   Serial.println("[ESC] Stop signal sent, waiting 2s for ESC boot...");
-  delay(2200);
-  Serial.println("[ESC] ESC ready (armed by default — send arm command to enable throttle)");
+  delay(ESC_ARM_DELAY);
+  Serial.println("[ESC] ESC ready. Motors stay OFF until 'arm' command.");
 
   // WiFi AP
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -596,10 +680,50 @@ void setup() {
   Serial.println(WiFi.softAPIP());
 
   setupServer();
+
+  // Stabilization runs on its own fixed-rate task (core 1, high prio),
+  // so WiFi hiccups can never stall the control loop.
+  xTaskCreatePinnedToCore(controlTask, "ctrl", 4096, NULL, 5, NULL, 1);
+  Serial.printf("[CTRL] Control task started @ %dHz\n", LOOP_HZ);
 }
 
 void loop() {
   server.handleClient();
-  mpuRead();            // ~400Hz possible, actual rate set by loop speed
-  delayMicroseconds(500); // ~2kHz loop
+
+  // ~10Hz bench readout — watch these during the props-off tilt test.
+  static uint32_t t = 0;
+  if (millis() - t >= 100) {
+    t = millis();
+    Serial.printf("R%+6.1f P%+6.1f Yz%+6.1f | M %3.0f %3.0f %3.0f %3.0f | %s\n",
+                  imu.roll, imu.pitch, imu.gz,
+                  lastM[0], lastM[1], lastM[2], lastM[3],
+                  armed ? "ARM" : "---");
+  }
+  delay(1);
 }
+
+/*
+What I rewrote in App/APFlightController.ino
+The old code stabilized the drone only when a WiFi packet arrived (~30Hz, with stalls up to 624ms in your logs). That's the #1 reason it "doesn't correct fast enough." The rewrite fixes the four ranked root causes:
+
+Fixed-rate control loop, decoupled from WiFi — stabilization now runs in a 500Hz FreeRTOS task (controlTask, pinned to core 1, high priority) that reads the IMU, runs PID, and drives motors every 2ms no matter what the radio is doing. The web handlers now only write setpoints. This is the big one.
+Gyro calibration at boot (calibrateGyro) — averages 1000 samples while still and subtracts the bias your logs showed (1–5°/s), so the angle estimate and yaw stop drifting. The drone must be sitting still for the first ~2s after power-on.
+Armed idle + link-loss failsafe — motors hold a safe idle (ESC_IDLE) while armed instead of cutting to zero on a stick blip; if no /drive packet arrives within 400ms it auto-levels and settles to idle. Full stop only on disarm.
+PID cleanup — derivative-on-measurement (no more "derivative kick" on stick moves), output clamps, and idle anti-windup.
+I also added ROLL_SIGN/PITCH_SIGN/YAW_SIGN trim macros and put the four motor values into /telem and the serial output, so you can verify signs on the bench.
+
+Structure checks pass (braces/parens balanced, no dangling references). I couldn't compile — there's no Arduino toolchain on this machine — so step 1 is to open it in the Arduino IDE (ESP32-S3) and Verify.
+
+⚠️ Bench test BEFORE flying — props OFF
+Watch the serial monitor @115200 (streams R<roll> P<pitch> Yz<yawrate> | M m1 m2 m3 m4). Arm, give a little throttle so all four spin, then:
+
+Tilt right → the two left motors (M1 BL, M2 FL) should speed up. If not, flip ROLL_SIGN to (-1).
+Tilt nose-down → the two rear motors (M1 BL, M3 BR) speed up. If not, flip PITCH_SIGN.
+Yaw the frame → the correct diagonal pair responds. If not, flip YAW_SIGN.
+Confirm all four reliably spin at idle — your sandbox ESC test needed ~65/1024, but I set ESC_IDLE=54 as a starting point. If any motor doesn't spin, raise ESC_IDLE.
+One extra thing to watch: if tilting roll makes the pitch number move (or vice-versa), your gyro is physically mounted with X/Y swapped — that's a code fix (swap gx/gy), not just a sign flip. Tell me and I'll handle it.
+
+Then test the failsafe (arm + throttle, kill WiFi → motors should drop to idle within ~0.4s), and only then do a first low hover in ANGLE mode in open space. If it oscillates, lower the P gains; if it's sluggish, raise them.
+
+Want me to also add an explicit "motor test" web button (spin one motor at a time) to make the props-off checkout easier, or is the serial readout enough?
+*/
